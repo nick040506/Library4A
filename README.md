@@ -73,7 +73,7 @@ The Library Management System offers secure and efficient management of books, a
 
    ```sql
    CREATE TABLE users (
-       userid INT(9) NOT NULL AUTO_INCREMENT,
+       userid INT NOT NULL AUTO_INCREMENT,
        username CHAR(255) NOT NULL,
        password TEXT NOT NULL,
        PRIMARY KEY (userid)
@@ -98,9 +98,13 @@ The Library Management System offers secure and efficient management of books, a
        PRIMARY KEY (collectionid)
    );
 
-   CREATE TABLE tokens (
-       token VARCHAR(512) PRIMARY KEY,
-       used_at DATETIME NOT NULL
+   CREATE TABLE user_tokens (
+       id  INT(11) PRIMARY KEY AUTO_INCREMENT,
+       userid  INT(11),
+       token VARCHAR(512),
+       action  VARCHAR(50),
+       create_at  TIMESTAMP,
+       status  ENUM
    );
    ```
 
