@@ -636,8 +636,8 @@ This project is developed as part of a midterm requirement for the ITPC 115(Syst
 
 If you need assistance or have any questions, feel free to reach out to me. Below are my contact details:
 
-- **Name:** Erbin James Derek A. Orodio
+- **Name:** Nick Allen S. Estonilo
 - **University:** Don Mariano Marcos Memorial State University (Mid-La Union Campus)
-- **Email:** eorodio04922@student.dmmmsu.edu.ph
-- **Phone:** 09064785854
+- **Email:** nestonilo21132@student.dmmmsu.edu.ph
+- **Phone:** 09690414109
 <p align="right">(<a href="#library-management-system">back to top</a>)</p>
