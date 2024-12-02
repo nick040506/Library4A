@@ -116,7 +116,7 @@ The Library Management System offers secure and efficient management of books, a
    <?php
    $servername = "localhost";
    $username = "root";
-   $password = "password";
+   $password = "";
    $dbname = "library";
    ?>
    ```
