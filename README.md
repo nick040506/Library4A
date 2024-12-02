@@ -39,7 +39,7 @@ The Library Management System offers secure and efficient management of books, a
 ### Prerequisites
 
 - XAMPP
-- SQLyog (or phpMyAdmin)
+- SQLyog
 - JWT PHP Library
 - Node.js
 - Composer
