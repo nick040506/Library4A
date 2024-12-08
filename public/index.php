@@ -1,929 +1,1669 @@
 <?php
-use \Psr\Http\Message\ServerRequestInterface as Request;
-use \Psr\Http\Message\ResponseInterface as Response;
+
+use Psr\Http\Message\ServerRequestInterface as Request;
+use Psr\Http\Message\ResponseInterface as Response;
+
 use Firebase\JWT\JWT;
 use Firebase\JWT\Key;
 
 require '../src/vendor/autoload.php';
+
 $app = new \Slim\App;
 
-
-
-
+// Secret key for JWT
+$key = 'server_hack';
 
 // Database connection details
 $servername = "localhost";
-$dbusername = "root";
-$dbpassword = "";
+$username = "root";
+$password = "";
 $dbname = "library";
 
+// Token rotation function for every endpoint
+function generateToken($userid)
+{
+    global $key;
 
-$config = [
-    'settings' => [
-        'displayErrorDetails' => true, // Enables detailed error messages
-    ],
-];
-$app = new \Slim\App($config);
+    // Token generation
+    $iat = time(); // Issued at time
+    $exp = $iat + 7200; // Expiration time (2 hours)
+
+    // Payload data for JWT
+    $payload = [
+        'iss' => 'http://library.org', // Issuer
+        'aud' => 'http://library.com', // Audience
+        'iat' => $iat,                 // Issued at time
+        'exp' => $exp,                 // Expiration time
+        'data' => [
+            'userid' => $userid        // User ID data
+        ]
+    ];
+
+    // Generate and return the token
+    return JWT::encode($payload, $key, 'HS256');
+}
 
 
+// Function to check if the token has been used
+function isTokenUsed($token, $conn)
+{
+    $stmt = $conn->prepare("SELECT * FROM used_tokens WHERE token = :token");
+    $stmt->bindParam(':token', $token);
+    $stmt->execute();
+    return $stmt->rowCount() > 0;  // Returns true if token is found (i.e., used)
+}
 
-
-
-
-
-// User login 
-$app->post('/user/login', function (Request $request, Response $response, array $args) use ($servername, $dbusername, $dbpassword, $dbname) {
-    $data = json_decode($request->getBody());
-    $usr = $data->username ?? '';
-    $pass = $data->password ?? '';
-
+// Function to validate the token
+function validateToken($token, $key)
+{
     try {
-        // Connect to the database
-        $conn = new PDO("mysql:host=$servername;dbname=$dbname", $dbusername, $dbpassword);
-        $conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-
-        // Validate username and password from database
-        $stmt = $conn->prepare("SELECT * FROM users WHERE username=:username");
-        $stmt->execute(['username' => $usr]);
-        $user = $stmt->fetch(PDO::FETCH_ASSOC);
-
-        // If user exists and password is correct
-        if ($user && hash('SHA256', $pass) === $user['password']) {
-            // Generate one-time-use tokens for different actions
-            $key = 'server_hack'; // Secret key for JWT token
-            $tokens = [];
-
-            // Define the actions that tokens will be generated for
-            $actions = [
-                'add_book',
-                'edit_book',
-                'delete_book',
-                'search_books',
-                'book_auth',
-                'add_author',
-                'edit_author', 
-                'delete_author',           
-                'search_authors',         
-                'author_auth',
-                'edit_user',
-                'delete_user',
-                'show_all_users',
-                'showAllBooksAndAuthors'
-            ];
-
-            // Generate and store tokens in the database
-            foreach ($actions as $action) {
-                $payload = [
-                    'sub' => $user['userid'],
-                    'action' => $action,
-                    'exp' => time() + 3600, // Token valid for 1 hour
-                    'one_time_use' => true // Mark it as one-time-use
-                ];
-
-                // Encode the JWT token
-                $token = JWT::encode($payload, $key, 'HS256');
-
-                // Save the token in the database
-                $stmt = $conn->prepare("
-                    INSERT INTO user_tokens (userid, token, action)
-                    VALUES (:userid, :token, :action)
-                ");
-                $stmt->execute([
-                    'userid' => $user['userid'],
-                    'token' => $token,
-                    'action' => $action
-                ]);
-
-                // Add token to the response
-                $tokens[$action] = $token;
-            }
-
-            // Respond with the generated tokens
-            return $response->withStatus(200)->getBody()->write(json_encode([
-                "status" => "success",
-                "message" => "Login successful",
-                "tokens" => $tokens
-            ]));
-        } else {
-            // If authentication fails, return error response
-            return $response->withStatus(401)->getBody()->write(json_encode([
-                "status" => "fail",
-                "message" => "Invalid username or password"
-            ]));
-        }
-    } catch (PDOException $e) {
-        // If there is a database error, return a 500 error
-        return $response->withStatus(500)->getBody()->write(json_encode([
-            "status" => "fail",
-            "message" => "Database error: " . $e->getMessage()
-        ]));
+        return JWT::decode($token, new Key($key, 'HS256'));
+    } catch (Exception $e) {
+        return false;  // Token is invalid or expired
     }
-});
+}
 
+function createDatabaseConnection($servername, $username, $password, $dbname)
+{
+    try {
+        // Create a new PDO connection
+        $conn = new PDO("mysql:host=$servername;dbname=$dbname", $username, $password);
+        $conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+        return $conn;  // Return the PDO connection
+    } catch (PDOException $e) {
+        // Handle connection errors
+        throw new Exception("Database connection failed: " . $e->getMessage());
+    }
+}
 
+function markTokenAsUsed($conn, $token)
+{
+    try {
+        $stmt = $conn->prepare("INSERT INTO used_tokens (token) VALUES (:token)");
+        $stmt->bindParam(':token', $token);
+        $stmt->execute();
+    } catch (PDOException $e) {
+        // Handle potential errors (optional)
+        throw new Exception("Error marking token as used: " . $e->getMessage());
+    }
+}
 
-
-
-
-
-
-
-
-
-// Endpoint for user registration
-$app->post('/user/register', function (Request $request, Response $response, array $args) use ($servername, $dbusername, $dbpassword, $dbname) {
+// user register 
+$app->post('/user/register', function (Request $request, Response $response, array $args) use ($servername, $username, $password, $dbname, $key) {
     $data = json_decode($request->getBody());
     $usr = $data->username;
     $pass = $data->password;
 
     try {
-        $conn = new PDO("mysql:host=$servername;dbname=$dbname", $dbusername, $dbpassword);
+        // Check if password is empty
+        if (empty($pass)) {
+            $response->getBody()->write(json_encode(array("status" => "fail", "data" => array("title" => "Password cannot be empty"))));
+            return $response->withStatus(400); // Bad request status
+        }
+
+        $conn = new PDO("mysql:host=$servername;dbname=$dbname", $username, $password);
         $conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-        
-        // Use prepared statements to prevent SQL injection
-        $stmt = $conn->prepare("INSERT INTO users(username, password) VALUES (:username, :password)");
-        $stmt->execute(['username' => $usr, 'password' => hash('SHA256', $pass)]);
-        
-        $response->getBody()->write(json_encode(["status" => "success", "data" => null]));
+
+        // Check if the username already exists
+        $stmt = $conn->prepare("SELECT * FROM users WHERE username = :username");
+        $stmt->bindParam(':username', $usr);
+        $stmt->execute();
+
+        if ($stmt->rowCount() > 0) {
+            // Username already exists, return error
+            $response->getBody()->write(json_encode(array("status" => "fail", "data" => array("title" => "Username already taken"))));
+        } else {
+            // Username does not exist, proceed with the registration
+            $sql = "INSERT INTO users (username, password) VALUES (:username, :password)";
+            $stmt = $conn->prepare($sql);
+            $hashedPassword = hash('SHA256', $pass); // Hashing password using SHA-256
+
+            $stmt->bindParam(':username', $usr);
+            $stmt->bindParam(':password', $hashedPassword);
+            $stmt->execute();
+
+            $response->getBody()->write(json_encode(array("status" => "success", "data" => null)));
+        }
     } catch (PDOException $e) {
-        $response->getBody()->write(json_encode(["status" => "fail", "data" => ["title" => $e->getMessage()]]));
-    }
-    
-    return $response;
-});
-
-
-
-
-
-
-// Delete User 
-$app->delete('/user/{userid}', function (Request $request, Response $response, array $args) use ($servername, $dbusername, $dbpassword, $dbname) {
-    $userid = $args['userid'];
-
-    // Extract the Authorization header
-    $authHeader = $request->getHeader('Authorization');
-    if (!$authHeader) {
-        return $response->withStatus(401)->getBody()->write(json_encode(["status" => "fail", "message" => "Missing Authorization header"]));
-    }
-
-    // Parse the JWT token from the Authorization header
-    $jwt = str_replace('Bearer ', '', $authHeader[0]);
-    $key = 'server_hack'; // Your secret key
-
-    try {
-        // Decode the JWT token
-        $decoded = JWT::decode($jwt, new Key($key, 'HS256'));
-
-        // Check if token has expired
-        if ($decoded->exp < time()) {
-            return $response->withStatus(401)->getBody()->write(json_encode(["status" => "fail", "message" => "Token expired"]));
-        }
-
-        // Verify the action
-        if ($decoded->action !== 'delete_user') {
-            return $response->withStatus(403)->getBody()->write(json_encode(["status" => "fail", "message" => "Invalid action for this token"]));
-        }
-
-        // Proceed with deleting the user if the token is valid
-        $conn = new PDO("mysql:host=$servername;dbname=$dbname", $dbusername, $dbpassword);
-        $conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-
-        // Start a transaction to maintain data integrity
-        $conn->beginTransaction();
-
-        // Step 1: Remove any user-related data if necessary (e.g., user-specific relationships in other tables)
-        // If you have relationships to handle (e.g., user_books), add delete logic here.
-
-        // Step 2: Delete the user from the `users` table
-        $stmt = $conn->prepare("DELETE FROM users WHERE userid=:userid");
-        $stmt->execute(['userid' => $userid]);
-
-        // Commit the transaction
-        $conn->commit();
-
-        $response->getBody()->write(json_encode(["status" => "success", "message" => "User deleted successfully"]));
-    } catch (Exception $e) {
-        // Handle JWT decoding errors or PDO errors
-        $conn->rollBack();
-        return $response->withStatus(500)->getBody()->write(json_encode(["status" => "fail", "message" => $e->getMessage()]));
+        $response->getBody()->write(json_encode(array("status" => "fail", "data" => array("title" => $e->getMessage()))));
     }
 
     return $response;
 });
 
-
-
-
-
-// User authentication to generate a token for the logged-in user
-$app->post('/user/authenticate', function (Request $request, Response $response, array $args) use ($servername, $dbusername, $dbpassword, $dbname) {
+$app->post('/user/authenticate', function (Request $request, Response $response, array $args) use ($servername, $username, $password, $dbname, $key) {
     $data = json_decode($request->getBody());
-    $usr = $data->username ?? '';
-    $pass = $data->password ?? '';
+    $usr = $data->username;
+    $pass = $data->password;
 
     try {
-        // Connect to the database
-        $conn = new PDO("mysql:host=$servername;dbname=$dbname", $dbusername, $dbpassword);
+        // Create a new PDO connection
+        $conn = new PDO("mysql:host=$servername;dbname=$dbname", $username, $password);
         $conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-        
-        // Check for user existence
-        $stmt = $conn->prepare("SELECT * FROM users WHERE username=:username AND password=:password");
-        $stmt->execute(['username' => $usr, 'password' => hash('SHA256', $pass)]);
-        $user = $stmt->fetch(PDO::FETCH_ASSOC);
 
-        if ($user) {
-            // Generate a single token for the logged-in user
-            $key = 'server_hack';
-            $payload = [
-                'sub' => $user['userid'], // User ID
-                'exp' => time() + 3600 // Token valid for 1 hour
-            ];
-            $token = JWT::encode($payload, $key, 'HS256');
+        // Prepare and execute the SQL query securely
+        $stmt = $conn->prepare("SELECT userid FROM users WHERE username = :username AND password = :password");
+        $stmt->bindParam(':username', $usr);
+        $hashedPassword = hash('SHA256', $pass); // Assign the hash to a variable
+        $stmt->bindParam(':password', $hashedPassword); // Pass the variable to bindParam
+        $stmt->execute();
+        $stmt->setFetchMode(PDO::FETCH_ASSOC);
+        $data = $stmt->fetchAll();
 
-            // Insert the generated token into the user_tokens table without expires_at
-            $stmt = $conn->prepare("
-                INSERT INTO user_tokens (userid, token, action)
-                VALUES (:userid, :token, 'authenticate')
-            ");
-            $stmt->execute([
-                'userid' => $user['userid'],
-                'token' => $token
-            ]);
 
-            // Return the generated token in the response
-            return $response->getBody()->write(json_encode([
+        if (count($data) === 1) {
+            // Generate a token using the helper function
+            $jwt = generateToken($data[0]['userid']);
+
+            // Return success response with the token
+            $response->getBody()->write(json_encode([
                 "status" => "success",
-                "token" => $token
+                "token" => $jwt,
+                "data" => null
             ]));
         } else {
-            // Authentication failed
-            return $response->withStatus(401)->getBody()->write(json_encode([
+            // Authentication failed response
+            $response->getBody()->write(json_encode([
                 "status" => "fail",
-                "message" => "Authentication failed"
+                "data" => ["title" => "Authentication Failed"]
             ]));
         }
     } catch (PDOException $e) {
-        // Database error
-        return $response->withStatus(500)->getBody()->write(json_encode([
-            "status" => "fail",
-            "message" => "Database error: " . $e->getMessage()
-        ]));
-    }
-});
-
-
-
-
-
-// Edit User endpoint with token validation
-$app->put('/user/edit/{userid}', function (Request $request, Response $response, array $args) use ($servername, $dbusername, $dbpassword, $dbname) {
-    $userid = $args['userid']; // Get user ID from the URL parameter
-    $data = json_decode($request->getBody(), true); // Get the data from the request body
-
-    // Get the new values for the user details (username and password)
-    $username = $data['username'] ?? null;
-    $password = $data['password'] ?? null;
-
-    // Check if the required fields are provided
-    if (!$username || !$password) {
-        return $response->withStatus(400)->getBody()->write(json_encode([
-            "status" => "fail",
-            "message" => "Username and password are required."
-        ]));
-    }
-
-    // Extract the Authorization header
-    $authHeader = $request->getHeader('Authorization');
-    if (!$authHeader) {
-        return $response->withStatus(401)->getBody()->write(json_encode([
-            "status" => "fail",
-            "message" => "Missing Authorization header"
-        ]));
-    }
-
-    // Parse the JWT token from the Authorization header
-    $jwt = str_replace('Bearer ', '', $authHeader[0]);
-    $key = 'server_hack'; // Your secret key
-
-    try {
-        // Decode the JWT token
-        $decoded = JWT::decode($jwt, new Key($key, 'HS256'));
-
-        // Check if token has expired
-        if ($decoded->exp < time()) {
-            return $response->withStatus(401)->getBody()->write(json_encode([
-                "status" => "fail",
-                "message" => "Token expired"
-            ]));
-        }
-
-        // Verify the action (must be 'edit_user' for this endpoint to proceed)
-        if ($decoded->action !== 'edit_user') {
-            return $response->withStatus(403)->getBody()->write(json_encode([
-                "status" => "fail",
-                "message" => "Invalid action for this token"
-            ]));
-        }
-
-        // Proceed with editing the user if the token is valid
-        $conn = new PDO("mysql:host=$servername;dbname=$dbname", $dbusername, $dbpassword);
-        $conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-
-        // Start a transaction to maintain data integrity
-        $conn->beginTransaction();
-
-        // Update user details in the database (excluding email)
-        $stmt = $conn->prepare("UPDATE users SET username = :username, password = :password WHERE userid = :userid");
-        $stmt->execute([
-            'username' => $username,
-            'password' => hash('SHA256', $password), // Hash the password
-            'userid' => $userid
-        ]);
-
-        // Commit the transaction
-        $conn->commit();
-
+        // Handle database connection errors
         $response->getBody()->write(json_encode([
-            "status" => "success",
-            "message" => "User details updated successfully."
-        ]));
-    } catch (Exception $e) {
-        // Handle JWT decoding errors or PDO errors
-        $conn->rollBack();
-        return $response->withStatus(500)->getBody()->write(json_encode([
             "status" => "fail",
-            "message" => $e->getMessage()
+            "data" => ["title" => $e->getMessage()]
         ]));
     }
-
     return $response;
 });
 
 
-
-
-
-$app->get('/users', function (Request $request, Response $response, array $args) use ($servername, $dbusername, $dbpassword, $dbname) {
-    $authHeader = $request->getHeader('Authorization');
-    if (!$authHeader) {
-        return $response->withStatus(401)->getBody()->write(json_encode(["status" => "fail", "message" => "Missing Authorization header"]));
-    }
-
-    $jwt = str_replace('Bearer ', '', $authHeader[0]);
-    $key = 'server_hack';
+$app->get('/user/display', function (Request $request, Response $response, array $args) use ($servername, $username, $password, $dbname, $key) {
+    $token = $request->getHeader('Authorization')[0] ?? '';
+    $token = str_replace('Bearer ', '', $token);  // Remove "Bearer " from token if present
 
     try {
-        // Decode and validate the JWT
-        $decoded = JWT::decode($jwt, new Key($key, 'HS256'));
+        // Create a new PDO connection
+        $conn = createDatabaseConnection($servername, $username, $password, $dbname);
 
-        // Check if the token action is allowed for viewing all users
-        if ($decoded->action !== 'show_all_users') {
-            return $response->withStatus(403)->getBody()->write(json_encode(["status" => "fail", "message" => "Invalid action for this token"]));
+        // Check if the token has already been used
+        if (isTokenUsed($token, $conn)) {
+            $response->getBody()->write(json_encode([
+                "status" => "fail",
+                "data" => ["title" => "Token has already been used"]
+            ]));
+            return $response->withStatus(403);  // Forbidden
         }
 
-        // Connect to the database
-        $conn = new PDO("mysql:host=$servername;dbname=$dbname", $dbusername, $dbpassword);
-        $conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+        // Validate the token
+        $decoded = validateToken($token, $key);
+        if (!$decoded) {
+            $response->getBody()->write(json_encode([
+                "status" => "fail",
+                "data" => ["title" => "Invalid or expired token"]
+            ]));
+            return $response->withStatus(401);  // Unauthorized
+        }
 
-        // Fetch all users from the users table
+        // Fetch the users from the database
         $stmt = $conn->prepare("SELECT userid, username FROM users");
         $stmt->execute();
         $users = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-        if ($users) {
-            return $response->withStatus(200)->getBody()->write(json_encode(["status" => "success", "data" => $users]));
-        } else {
-            return $response->withStatus(404)->getBody()->write(json_encode(["status" => "fail", "message" => "No users found"]));
-        }
-    } catch (Exception $e) {
-        return $response->withStatus(401)->getBody()->write(json_encode(["status" => "fail", "message" => "Invalid token: " . $e->getMessage()]));
-    } catch (PDOException $e) {
-        return $response->withStatus(500)->getBody()->write(json_encode(["status" => "fail", "message" => "Database error: " . $e->getMessage()]));
-    }
-});
+        // Mark the token as used
+        markTokenAsUsed($conn, $token);
 
+        // Generate a new token using the function
+        $newToken = generateToken($decoded->data->userid);
 
+        // Return the users and the new token in the response
+        $response->getBody()->write(json_encode([
+            "status" => "success",
+            "token" => $newToken,
+            "data" => $users
 
-
-// Author authentication to retrieve associated books only
-$app->post('/author/authenticate', function (Request $request, Response $response, array $args) use ($servername, $dbusername, $dbpassword, $dbname) {
-    $data = json_decode($request->getBody());
-    $authorId = $data->authorid; // Get author ID from the request
-
-    try {
-        $conn = new PDO("mysql:host=$servername;dbname=$dbname", $dbusername, $dbpassword);
-        $conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-
-        // Use prepared statements to prevent SQL injection
-        $stmt = $conn->prepare("SELECT b.bookid, b.title 
-                        FROM books b
-                        JOIN books_authors ba ON b.bookid = ba.bookid 
-                        WHERE ba.authorid = :authorid");
-        $stmt->execute(['authorid' => $authorId]);
-        $books = $stmt->fetchAll(PDO::FETCH_ASSOC);
-
-        if ($books) {
-            // Return only the list of books
-            $response->getBody()->write(json_encode([
-                "status" => "success",
-                "books" => array_map(function($book) {
-                    return [
-                        "bookid" => $book['bookid'],
-                        "title" => $book['title']
-                    ];
-                }, $books)
-            ]));
-        } else {
-            return $response->withStatus(404)->getBody()->write(json_encode([
-                "status" => "fail",
-                "message" => "No books found for this author"
-            ]));
-        }
-    } catch (PDOException $e) {
-        return $response->withStatus(500)->getBody()->write(json_encode([
-            "status" => "fail",
-            "message" => $e->getMessage()
         ]));
+        return $response->withStatus(200);  // Success
+    } catch (PDOException $e) {
+        // Handle DB errors
+        $response->getBody()->write(json_encode([
+            "status" => "fail",
+            "data" => ["title" => $e->getMessage()]
+        ]));
+        return $response->withStatus(500);  // Internal Server Error
+    }
+});
+
+// Update user info (username and/or password) with token validation and token cannot be reused
+$app->put('/user/update', function (Request $request, Response $response, array $args) use ($servername, $username, $password, $dbname, $key) {
+    $token = $request->getHeader('Authorization')[0] ?? '';
+    $token = str_replace('Bearer ', '', $token);
+    $data = json_decode($request->getBody());
+
+    $newUsername = $data->username ?? null;  // Optional field
+    $newPassword = $data->password ?? null;  // Optional field
+
+    try {
+        // Create a new PDO connection using the function
+        $conn = createDatabaseConnection($servername, $username, $password, $dbname);
+
+        // Check if the token has already been used
+        if (isTokenUsed($token, $conn)) {
+            // Token has already been used, return an error
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Token has already been used")
+            )));
+            return $response->withStatus(403);  // Forbidden
+        }
+
+        // Validate the token
+        $decoded = validateToken($token, $key);
+        if (!$decoded) {
+            // Token validation failed (invalid or expired token)
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Invalid or expired token")
+            )));
+            return $response->withStatus(401);  // Unauthorized
+        }
+
+        // Extract the user ID from the token's payload
+        $userId = $decoded->data->userid;
+
+        // Ensure at least one field is being updated (username or password)
+        if (empty($newUsername) && empty($newPassword)) {
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "No fields to update")
+            )));
+            return $response->withStatus(400);  // Bad Request
+        }
+
+        // If updating username, check for uniqueness
+        if ($newUsername) {
+            $stmt = $conn->prepare("SELECT * FROM users WHERE username = :username AND userid != :userid");
+            $stmt->bindParam(':username', $newUsername);
+            $stmt->bindParam(':userid', $userId);
+            $stmt->execute();
+
+            if ($stmt->rowCount() > 0) {
+                // Username already exists
+                $response->getBody()->write(json_encode(array(
+                    "status" => "fail",
+                    "data" => array("title" => "Username already taken")
+                )));
+                return $response->withStatus(400);  // Bad Request
+            }
+        }
+
+        // Prepare the update statement
+        $updateFields = [];
+        $updateValues = [];
+
+        if ($newUsername) {
+            $updateFields[] = "username = :username";
+            $updateValues[':username'] = $newUsername;
+        }
+
+        if ($newPassword) {
+            // Hash the new password before storing it
+            $hashedPassword = hash('SHA256', $newPassword);
+            $updateFields[] = "password = :password";
+            $updateValues[':password'] = $hashedPassword;
+        }
+
+        // Build and execute the update query
+        $sql = "UPDATE users SET " . implode(", ", $updateFields) . " WHERE userid = :userid";
+        $stmt = $conn->prepare($sql);
+        $stmt->bindParam(':userid', $userId);
+        foreach ($updateValues as $placeholder => $value) {
+            $stmt->bindValue($placeholder, $value);
+        }
+        $stmt->execute();
+
+        // Mark the old token as used
+        markTokenAsUsed($conn, $token);
+
+        // Generate a new token with updated user data
+        $newToken = generateToken($userId);
+
+        // Return the success response with the new token
+        $response->getBody()->write(json_encode(array(
+            "status" => "success",
+            "token" => $newToken,
+            "data" => null
+        )));
+    } catch (PDOException $e) {
+        // Handle DB errors
+        $response->getBody()->write(json_encode(array(
+            "status" => "fail",
+            "data" => array("title" => $e->getMessage())
+        )));
+        return $response->withStatus(500);  // Internal Server Error
     }
 
     return $response;
 });
 
 
-
-
-
-
-// Delete Author with JWT Authentication
-$app->delete('/author/{authorid}', function (Request $request, Response $response, array $args) use ($servername, $dbusername, $dbpassword, $dbname) {
-    $authorid = $args['authorid'];
-
-    // Extract the Authorization header
-    $authHeader = $request->getHeader('Authorization');
-    if (!$authHeader) {
-        return $response->withStatus(401)->getBody()->write(json_encode(["status" => "fail", "message" => "Missing Authorization header"]));
-    }
-
-    // Parse the JWT token from the Authorization header
-    $jwt = str_replace('Bearer ', '', $authHeader[0]);
-    $key = 'server_hack'; // Your secret key
+// Delete user by userid
+$app->delete('/user/delete', function (Request $request, Response $response, array $args) use ($servername, $username, $password, $dbname, $key) {
+    $token = $request->getHeader('Authorization')[0] ?? '';
+    $token = str_replace('Bearer ', '', $token);
 
     try {
-        // Decode the JWT token
-        $decoded = JWT::decode($jwt, new Key($key, 'HS256'));
+        // Create a new PDO connection using the function
+        $conn = createDatabaseConnection($servername, $username, $password, $dbname);
 
-        // Check if token has expired
-        if ($decoded->exp < time()) {
-            return $response->withStatus(401)->getBody()->write(json_encode(["status" => "fail", "message" => "Token expired"]));
+        // Check if the token has already been used
+        if (isTokenUsed($token, $conn)) {
+            // Token has already been used, return an error
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Token has already been used")
+            )));
+            return $response->withStatus(403);  // Forbidden
         }
 
-        // Proceed with deleting the author if the token is valid
-        $conn = new PDO("mysql:host=$servername;dbname=$dbname", $dbusername, $dbpassword);
-        $conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-
-        // Start a transaction to maintain data integrity
-        $conn->beginTransaction();
-
-        // Step 1: Remove the association between the author and books from the `books_authors` table
-        $stmt = $conn->prepare("DELETE FROM books_authors WHERE authorid=:authorid");
-        $stmt->execute(['authorid' => $authorid]);
-
-        // Step 2: Delete the author from the `authors` table
-        $stmt = $conn->prepare("DELETE FROM authors WHERE authorid=:authorid");
-        $stmt->execute(['authorid' => $authorid]);
-
-        // Commit the transaction
-        $conn->commit();
-
-        $response->getBody()->write(json_encode(["status" => "success", "message" => "Author deleted successfully"]));
-    } catch (Exception $e) {
-        // Handle JWT decoding errors or PDO errors
-        return $response->withStatus(500)->getBody()->write(json_encode(["status" => "fail", "message" => $e->getMessage()]));
-    }
-
-    return $response;
-});
-
-
-
-
-
-// Edit Author
-$app->put('/author/edit/{authorid}', function (Request $request, Response $response, array $args) use ($servername, $dbusername, $dbpassword, $dbname) {
-    // Extract JWT from the Authorization header
-    $authHeader = $request->getHeader('Authorization');
-    if (!$authHeader) {
-        return $response->withStatus(401)->getBody()->write(json_encode(["status" => "fail", "message" => "Missing Authorization header"]));
-    }
-
-    $jwt = str_replace('Bearer ', '', $authHeader[0]);
-    $key = 'server_hack';
-
-    try {
-        // Decode the JWT and validate the token
-        $decoded = JWT::decode($jwt, new Key($key, 'HS256'));
-
-        // Check if token has expired
-        if ($decoded->exp < time()) {
-            return $response->withStatus(401)->getBody()->write(json_encode(["status" => "fail", "message" => "Token expired"]));
+        // Validate the token
+        $decoded = validateToken($token, $key);
+        if (!$decoded) {
+            // Token validation failed (invalid or expired token)
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Invalid or expired token")
+            )));
+            return $response->withStatus(401);  // Unauthorized
         }
 
-        // Check the action
-        if ($decoded->action !== 'edit_author') {
-            return $response->withStatus(403)->getBody()->write(json_encode(["status" => "fail", "message" => "Invalid action for this token"]));
-        }
+        // Extract the user ID from the token's payload
+        $userId = $decoded->data->userid;
 
-        // Get the author ID from the URL
-        $authorid = $args['authorid'];
-        $data = json_decode($request->getBody());
-        $newName = $data->name; // Get the new name from the request body
-
-        // Database connection
-        $conn = new PDO("mysql:host=$servername;dbname=$dbname", $dbusername, $dbpassword);
-        $conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-
-        // Prepare and execute the update statement
-        $stmt = $conn->prepare("UPDATE authors SET name = :name WHERE authorid = :authorid");
-        $stmt->execute(['name' => $newName, 'authorid' => $authorid]);
+        // Delete the user from the database
+        $stmt = $conn->prepare("DELETE FROM users WHERE userid = :userid");
+        $stmt->bindParam(':userid', $userId);
+        $stmt->execute();
 
         // Check if any rows were affected
-        if ($stmt->rowCount() > 0) {
-            $response->getBody()->write(json_encode(["status" => "success", "message" => "Author updated successfully"]));
-        } else {
-            return $response->withStatus(404)->getBody()->write(json_encode(["status" => "fail", "message" => "Author not found or no change made"]));
+        if ($stmt->rowCount() === 0) {
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "User not found")
+            )));
+            return $response->withStatus(404);  // Not Found
         }
-    } catch (Exception $e) {
-        return $response->withStatus(401)->getBody()->write(json_encode(["status" => "fail", "message" => "Invalid token: " . $e->getMessage()]));
+
+        // 6. Mark the token as used by inserting it into the `used_tokens` table
+        $stmt = $conn->prepare("INSERT INTO used_tokens (token) VALUES (:token)");
+        $stmt->bindParam(':token', $token);
+        $stmt->execute();
+
+        // 7. Return success response
+        $response->getBody()->write(json_encode(array(
+            "status" => "success",
+            "data" => null
+        )));
     } catch (PDOException $e) {
-        return $response->withStatus(500)->getBody()->write(json_encode(["status" => "fail", "message" => $e->getMessage()]));
+        // Handle DB errors
+        $response->getBody()->write(json_encode(array(
+            "status" => "fail",
+            "data" => array("title" => $e->getMessage())
+        )));
+        return $response->withStatus(500);  // Internal Server Error
     }
 
     return $response;
 });
 
-
-
-
-
-
-
-
-// Add Book with Duplicate Book Check
-$app->post('/book/add', function (Request $request, Response $response, array $args) use ($servername, $dbusername, $dbpassword, $dbname) {
-    // Extract JWT from the Authorization header
-    $authHeader = $request->getHeader('Authorization');
-    if (!$authHeader) {
-        return $response->withStatus(401)->getBody()->write(json_encode(["status" => "fail", "message" => "Missing Authorization header"]));
-    }
-
-    $jwt = str_replace('Bearer ', '', $authHeader[0]);
-    $key = 'server_hack';
-
-    try {
-        // Decode the JWT and validate the token
-        $decoded = JWT::decode($jwt, new Key($key, 'HS256'));
-
-        // Check if token has expired
-        if ($decoded->exp < time()) {
-            return $response->withStatus(401)->getBody()->write(json_encode(["status" => "fail", "message" => "Token expired"]));
-        }
-
-        // Check if the action in the token is 'add_book'
-        if ($decoded->action !== 'add_book') {
-            return $response->withStatus(403)->getBody()->write(json_encode(["status" => "fail", "message" => "You do not have permission to add a book"]));
-        }
-
-        // Continue with adding the book if token is valid
-        $data = json_decode($request->getBody());
-        $title = $data->title;
-        $authorName = $data->authorName; // Get author name from the request
-
-        try {
-            $conn = new PDO("mysql:host=$servername;dbname=$dbname", $dbusername, $dbpassword);
-            $conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-
-            // Start a transaction
-            $conn->beginTransaction();
-
-            // Step 1: Check if the author already exists in the database
-            $stmt = $conn->prepare("SELECT * FROM authors WHERE name=:name");
-            $stmt->execute(['name' => $authorName]);
-            $author = $stmt->fetch(PDO::FETCH_ASSOC);
-
-            if (!$author) {
-                // Author does not exist, so we insert it
-                $stmt = $conn->prepare("INSERT INTO authors(name) VALUES (:name)");
-                $stmt->execute(['name' => $authorName]);
-                $authorId = $conn->lastInsertId();
-            } else {
-                // Author already exists, get their ID
-                $authorId = $author['authorid'];
-            }
-
-            // Step 2: Check if the book already exists for the author
-            $stmt = $conn->prepare("SELECT * FROM books b
-                                    JOIN books_authors ba ON b.bookid = ba.bookid
-                                    WHERE b.title = :title AND ba.authorid = :authorid");
-            $stmt->execute(['title' => $title, 'authorid' => $authorId]);
-            $book = $stmt->fetch(PDO::FETCH_ASSOC);
-
-            if ($book) {
-                // Book already exists for this author
-                return $response->withStatus(400)->getBody()->write(json_encode([
-                    "status" => "fail",
-                    "message" => "This book already exists for the author"
-                ]));
-            }
-
-            // Step 3: Insert the book into the books table
-            $stmt = $conn->prepare("INSERT INTO books(title) VALUES (:title)");
-            $stmt->execute(['title' => $title]);
-
-            // Get the last inserted book ID
-            $bookId = $conn->lastInsertId();
-
-            // Step 4: Associate the book with the author in books_authors
-            $stmt = $conn->prepare("INSERT INTO books_authors(bookid, authorid) VALUES (:bookid, :authorid)");
-            $stmt->execute(['bookid' => $bookId, 'authorid' => $authorId]);
-
-            // Commit the transaction
-            $conn->commit();
-
-            $response->getBody()->write(json_encode([
-                "status" => "success",
-                "bookid" => $bookId,
-                "authorid" => $authorId
-            ]));
-        } catch (PDOException $e) {
-            // Roll back the transaction on error
-            $conn->rollBack();
-            return $response->withStatus(500)->getBody()->write(json_encode(["status" => "fail", "message" => $e->getMessage()]));
-        }
-    } catch (Exception $e) {
-        return $response->withStatus(401)->getBody()->write(json_encode(["status" => "fail", "message" => "Invalid token: " . $e->getMessage()]));
-    }
-
-    return $response;
-});
-
-
-
-
-
-
-// Book authentication to retrieve associated authors only
-$app->post('/book/authenticate', function (Request $request, Response $response, array $args) use ($servername, $dbusername, $dbpassword, $dbname) {
+// Add author
+$app->post('/author/add', function (Request $request, Response $response, array $args) use ($servername, $username, $password, $dbname, $key) {
+    $token = $request->getHeader('Authorization')[0] ?? '';
+    $token = str_replace('Bearer ', '', $token);
     $data = json_decode($request->getBody());
-    $bookId = $data->bookid; // Get book ID from the request
+    $name = $data->name ?? null;
 
     try {
-        $conn = new PDO("mysql:host=$servername;dbname=$dbname", $dbusername, $dbpassword);
-        $conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+        // Create a new PDO connection using the function
+        $conn = createDatabaseConnection($servername, $username, $password, $dbname);
 
-        // Use prepared statements to prevent SQL injection
-        $stmt = $conn->prepare("SELECT a.authorid, a.name 
-                        FROM authors a
-                        JOIN books_authors ba ON a.authorid = ba.authorid
-                        WHERE ba.bookid = :bookid");
-        $stmt->execute(['bookid' => $bookId]);
+        // Check if the token has already been used
+        if (isTokenUsed($token, $conn)) {
+            // Token has already been used, return an error
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Token has already been used")
+            )));
+            return $response->withStatus(403);  // Forbidden
+        }
+
+        // Validate the token
+        $decoded = validateToken($token, $key);
+        if (!$decoded) {
+            // Token validation failed (invalid or expired token)
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Invalid or expired token")
+            )));
+            return $response->withStatus(401);  // Unauthorized
+        }
+
+        // Extract user ID from token
+        $userId = $decoded->data->userid;
+
+        // Ensure name is provided
+        if (empty($name)) {
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Name cannot be empty")
+            )));
+            return $response->withStatus(400);  // Bad Request
+        }
+
+        // Check if the author name already exists
+        $stmt = $conn->prepare("SELECT * FROM authors WHERE name = :name");
+        $stmt->bindParam(':name', $name);
+        $stmt->execute();
+
+        if ($stmt->rowCount() > 0) {
+            // Author already exists, return error
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Author already exists")
+            )));
+            return $response->withStatus(400);  // Bad Request
+        }
+
+        // Insert new author into the database
+        $sql = "INSERT INTO authors (name) VALUES (:name)";
+        $stmt = $conn->prepare($sql);
+        $stmt->bindParam(':name', $name);
+        $stmt->execute();
+
+        // Mark the token as used
+        markTokenAsUsed($conn, $token);
+
+        // Generate a new token with updated user information (if necessary)
+        $newToken = generateToken($userId);
+
+        // Return success response with the new token
+        $response->getBody()->write(json_encode(array(
+            "status" => "success",
+            "token" => $newToken,
+            "data" => null
+        )));
+    } catch (PDOException $e) {
+        // Handle DB errors
+        $response->getBody()->write(json_encode(array(
+            "status" => "fail",
+            "data" => array("title" => $e->getMessage())
+        )));
+        return $response->withStatus(500);  // Internal Server Error
+    }
+
+    return $response;
+});
+
+// Display author
+$app->get('/author/display', function (Request $request, Response $response, array $args) use ($servername, $username, $password, $dbname, $key) {
+    $token = $request->getHeader('Authorization')[0] ?? '';
+    $token = str_replace('Bearer ', '', $token);
+
+    try {
+        // Create a new PDO connection using the function
+        $conn = createDatabaseConnection($servername, $username, $password, $dbname);
+
+        // Check if the token has already been used
+        if (isTokenUsed($token, $conn)) {
+            // Token has already been used, return an error
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Token has already been used")
+            )));
+            return $response->withStatus(403);  // Forbidden
+        }
+
+        // Validate the token
+        $decoded = validateToken($token, $key);
+        if (!$decoded) {
+            // Token validation failed (invalid or expired token)
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Invalid or expired token")
+            )));
+            return $response->withStatus(401);  // Unauthorized
+        }
+
+        // Extract user ID from token for rotation
+        $userId = $decoded->data->userid;
+
+        // Fetch the authors from the database
+        $stmt = $conn->prepare("SELECT authorid, name FROM authors");
+        $stmt->execute();
         $authors = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-        if ($authors) {
-            // Return only the list of authors
-            $response->getBody()->write(json_encode([
-                "status" => "success",
-                "authors" => array_map(function($author) {
-                    return [
-                        "authorid" => $author['authorid'],
-                        "name" => $author['name']
-                    ];
-                }, $authors)
-            ]));
-        } else {
-            return $response->withStatus(404)->getBody()->write(json_encode([
-                "status" => "fail",
-                "message" => "No authors found for this book"
-            ]));
-        }
+        // Mark the token as used
+        markTokenAsUsed($conn, $token);
+
+        // Generate a new token for the user
+        $newToken = generateToken($userId);
+
+        // Return the authors as a response along with the new token
+        $response->getBody()->write(json_encode(array(
+            "status" => "success",
+            "token" => $newToken,
+            "data" => $authors
+        )));
     } catch (PDOException $e) {
-        return $response->withStatus(500)->getBody()->write(json_encode([
+        // Handle DB errors
+        $response->getBody()->write(json_encode(array(
             "status" => "fail",
-            "message" => $e->getMessage()
-        ]));
+            "data" => array("title" => $e->getMessage())
+        )));
+        return $response->withStatus(500);  // Internal Server Error
     }
 
     return $response;
 });
 
 
-
-
-
-
-
-// Delete Book with JWT Authentication
-$app->delete('/book/{bookid}', function (Request $request, Response $response, array $args) use ($servername, $dbusername, $dbpassword, $dbname) {
-    $bookid = $args['bookid'];
-
-    // Extract the Authorization header
-    $authHeader = $request->getHeader('Authorization');
-    if (!$authHeader) {
-        return $response->withStatus(401)->getBody()->write(json_encode(["status" => "fail", "message" => "Missing Authorization header"]));
-    }
-
-    // Parse the JWT token from the Authorization header
-    $jwt = str_replace('Bearer ', '', $authHeader[0]);
-    $key = 'server_hack'; // Your secret key
+// Update author info
+$app->put('/author/update', function (Request $request, Response $response, array $args) use ($servername, $username, $password, $dbname, $key) {
+    $token = $request->getHeader('Authorization')[0] ?? '';
+    $token = str_replace('Bearer ', '', $token);
+    $data = json_decode($request->getBody());
+    $authorId = $data->authorid ?? null;  // Required field
+    $newName = $data->name ?? null;  // Optional field
 
     try {
-        // Decode the JWT token
-        $decoded = JWT::decode($jwt, new Key($key, 'HS256'));
+        // Create a new PDO connection using the function
+        $conn = createDatabaseConnection($servername, $username, $password, $dbname);
 
-        // Check if token has expired
-        if ($decoded->exp < time()) {
-            return $response->withStatus(401)->getBody()->write(json_encode(["status" => "fail", "message" => "Token expired"]));
+        // Check if the token has already been used
+        if (isTokenUsed($token, $conn)) {
+            // Token has already been used, return an error
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Token has already been used")
+            )));
+            return $response->withStatus(403);  // Forbidden
         }
 
-        // Check the action
-        if ($decoded->action !== 'delete_book') {
-            return $response->withStatus(403)->getBody()->write(json_encode(["status" => "fail", "message" => "Invalid action for this token"]));
+        // Validate the token
+        $decoded = validateToken($token, $key);
+        if (!$decoded) {
+            // Token validation failed (invalid or expired token)
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Invalid or expired token")
+            )));
+            return $response->withStatus(401);  // Unauthorized
         }
 
-        // Proceed with deleting the book if the token is valid
-        $conn = new PDO("mysql:host=$servername;dbname=$dbname", $dbusername, $dbpassword);
-        $conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+        // Extract user ID from token for rotation
+        $userId = $decoded->data->userid;
 
-        // Start a transaction to maintain data integrity
-        $conn->beginTransaction();
+        // Ensure the author ID is provided
+        if (empty($authorId)) {
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Author ID is required")
+            )));
+            return $response->withStatus(400);  // Bad Request
+        }
 
-        // Step 1: Remove the association between the book and the author from the `books_authors` table
-        $stmt = $conn->prepare("DELETE FROM books_authors WHERE bookid=:bookid");
-        $stmt->execute(['bookid' => $bookid]);
+        // Prepare the update statement
+        if ($newName) {
+            // Check if the author ID exists
+            $stmt = $conn->prepare("SELECT * FROM authors WHERE authorid = :authorid");
+            $stmt->bindParam(':authorid', $authorId);
+            $stmt->execute();
 
-        // Step 2: Delete the book itself from the `books` table
-        $stmt = $conn->prepare("DELETE FROM books WHERE bookid=:bookid");
-        $stmt->execute(['bookid' => $bookid]);
+            if ($stmt->rowCount() == 0) {
+                // Author ID does not exist
+                $response->getBody()->write(json_encode(array(
+                    "status" => "fail",
+                    "data" => array("title" => "Author ID not found")
+                )));
+                return $response->withStatus(404);  // Not Found
+            }
 
-        // Commit the transaction
-        $conn->commit();
+            // Update the author's name
+            $stmt = $conn->prepare("UPDATE authors SET name = :name WHERE authorid = :authorid");
+            $stmt->bindParam(':name', $newName);
+            $stmt->bindParam(':authorid', $authorId);
+            $stmt->execute();
+        } else {
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "No fields to update")
+            )));
+            return $response->withStatus(400);  // Bad Request
+        }
 
-        $response->getBody()->write(json_encode(["status" => "success", "message" => "Book deleted successfully"]));
-    } catch (Exception $e) {
-        // Rollback the transaction on error
-        $conn->rollBack();
-        // Handle JWT decoding errors or PDO errors
-        return $response->withStatus(500)->getBody()->write(json_encode(["status" => "fail", "message" => $e->getMessage()]));
+        // Mark the token as used
+        markTokenAsUsed($conn, $token);
+
+        // Generate a new token for the user
+        $newToken = generateToken($userId);
+
+        // Return success response with the new token
+        $response->getBody()->write(json_encode(array(
+            "status" => "success",
+            "token" => $newToken,
+            "data" => null
+        )));
+    } catch (PDOException $e) {
+        // Handle DB errors
+        $response->getBody()->write(json_encode(array(
+            "status" => "fail",
+            "data" => array("title" => $e->getMessage())
+        )));
+        return $response->withStatus(500);  // Internal Server Error
     }
 
     return $response;
 });
 
 
-
-
-
-// Edit Book
-$app->put('/book/edit/{bookid}', function (Request $request, Response $response, array $args) use ($servername, $dbusername, $dbpassword, $dbname) {
-    // Extract JWT from the Authorization header
-    $authHeader = $request->getHeader('Authorization');
-    if (!$authHeader) {
-        return $response->withStatus(401)->getBody()->write(json_encode(["status" => "fail", "message" => "Missing Authorization header"]));
-    }
-
-    $jwt = str_replace('Bearer ', '', $authHeader[0]);
-    $key = 'server_hack';
+// Delete author
+$app->delete('/author/delete', function (Request $request, Response $response, array $args) use ($servername, $username, $password, $dbname, $key) {
+    $token = $request->getHeader('Authorization')[0] ?? '';
+    $token = str_replace('Bearer ', '', $token);
+    $data = json_decode($request->getBody());
+    $authorId = $data->authorid ?? null;  // Required field
 
     try {
-        // Decode the JWT and validate the token
-        $decoded = JWT::decode($jwt, new Key($key, 'HS256'));
+        // Create a new PDO connection using the function
+        $conn = createDatabaseConnection($servername, $username, $password, $dbname);
 
-        // Check if token has expired
-        if ($decoded->exp < time()) {
-            return $response->withStatus(401)->getBody()->write(json_encode(["status" => "fail", "message" => "Token expired"]));
+        // Check if the token has already been used
+        if (isTokenUsed($token, $conn)) {
+            // Token has already been used, return an error
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Token has already been used")
+            )));
+            return $response->withStatus(403);  // Forbidden
         }
 
-        // Check the action
-        if ($decoded->action !== 'edit_book') {
-            return $response->withStatus(403)->getBody()->write(json_encode(["status" => "fail", "message" => "Invalid action for this token"]));
+        // Validate the token
+        $decoded = validateToken($token, $key);
+        if (!$decoded) {
+            // Token validation failed (invalid or expired token)
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Invalid or expired token")
+            )));
+            return $response->withStatus(401);  // Unauthorized
         }
 
-        // Continue if token is valid
-        $bookId = $args['bookid'];
-        $data = json_decode($request->getBody());
+        // Extract user ID from token for rotation
+        $userId = $decoded->data->userid;
 
-        // Extract new book details from the request
-        $newTitle = $data->title ?? null;
-        $newAuthorName = $data->authorName ?? null; // Optional: new author name
-
-        try {
-            $conn = new PDO("mysql:host=$servername;dbname=$dbname", $dbusername, $dbpassword);
-            $conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-
-            // Start a transaction to ensure data integrity
-            $conn->beginTransaction();
-
-            // Step 1: Check if the book exists
-            $stmt = $conn->prepare("SELECT * FROM books WHERE bookid = :bookid");
-            $stmt->execute(['bookid' => $bookId]);
-            $book = $stmt->fetch(PDO::FETCH_ASSOC);
-
-            if (!$book) {
-                return $response->withStatus(404)->getBody()->write(json_encode(["status" => "fail", "message" => "Book not found"]));
-            }
-
-            // Step 2: Update the book title if a new title is provided
-            if ($newTitle) {
-                $stmt = $conn->prepare("UPDATE books SET title = :title WHERE bookid = :bookid");
-                $stmt->execute(['title' => $newTitle, 'bookid' => $bookId]);
-            }
-
-            // Step 3: Update the author if a new author is provided
-            if ($newAuthorName) {
-                // Check if the new author exists
-                $stmt = $conn->prepare("SELECT * FROM authors WHERE name = :name");
-                $stmt->execute(['name' => $newAuthorName]);
-                $author = $stmt->fetch(PDO::FETCH_ASSOC);
-
-                if (!$author) {
-                    // If the author doesn't exist, insert a new one
-                    $stmt = $conn->prepare("INSERT INTO authors(name) VALUES (:name)");
-                    $stmt->execute(['name' => $newAuthorName]);
-                    $newAuthorId = $conn->lastInsertId();
-                } else {
-                    // If the author exists, use the existing author's ID
-                    $newAuthorId = $author['authorid'];
-                }
-
-                // Update the relationship in books_authors
-                $stmt = $conn->prepare("UPDATE books_authors SET authorid = :authorid WHERE bookid = :bookid");
-                $stmt->execute(['authorid' => $newAuthorId, 'bookid' => $bookId]);
-            }
-
-            // Commit the transaction
-            $conn->commit();
-
-            $response->getBody()->write(json_encode(["status" => "success", "message" => "Book updated successfully"]));
-        } catch (PDOException $e) {
-            // Rollback the transaction on error
-            $conn->rollBack();
-            return $response->withStatus(500)->getBody()->write(json_encode(["status" => "fail", "message" => $e->getMessage()]));
+        // Ensure the author ID is provided
+        if (empty($authorId)) {
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Author ID is required")
+            )));
+            return $response->withStatus(400);  // Bad Request
         }
-    } catch (Exception $e) {
-        return $response->withStatus(401)->getBody()->write(json_encode(["status" => "fail", "message" => "Invalid token: " . $e->getMessage()]));
+
+        // Check if the author ID exists
+        $stmt = $conn->prepare("SELECT * FROM authors WHERE authorid = :authorid");
+        $stmt->bindParam(':authorid', $authorId);
+        $stmt->execute();
+
+        if ($stmt->rowCount() == 0) {
+            // Author ID does not exist
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Author ID not found")
+            )));
+            return $response->withStatus(404);  // Not Found
+        }
+
+        // Proceed to delete the author
+        $stmt = $conn->prepare("DELETE FROM authors WHERE authorid = :authorid");
+        $stmt->bindParam(':authorid', $authorId);
+        $stmt->execute();
+
+        // Mark the token as used
+        markTokenAsUsed($conn, $token);
+
+        // Generate a new token for the user
+        $newToken = generateToken($userId);
+
+        // Return success response with the new token
+        $response->getBody()->write(json_encode(array(
+            "status" => "success",
+            "token" => $newToken,
+            "data" => null
+        )));
+    } catch (PDOException $e) {
+        // Handle DB errors
+        $response->getBody()->write(json_encode(array(
+            "status" => "fail",
+            "data" => array("title" => $e->getMessage())
+        )));
+        return $response->withStatus(500);  // Internal Server Error
     }
 
     return $response;
 });
 
 
-
-
-
-
-// Show All Books (Book ID and Title Only)
-$app->get('/books', function (Request $request, Response $response, array $args) use ($servername, $dbusername, $dbpassword, $dbname) {
-    // Extract JWT from the Authorization header
-    $authHeader = $request->getHeader('Authorization');
-    if (!$authHeader) {
-        return $response->withStatus(401)->getBody()->write(json_encode(["status" => "fail", "message" => "Missing Authorization header"]));
-    }
-
-    $jwt = str_replace('Bearer ', '', $authHeader[0]);
-    $key = 'server_hack';
+// Add book
+$app->post('/book/add', function (Request $request, Response $response, array $args) use ($servername, $username, $password, $dbname, $key) {
+    $token = $request->getHeader('Authorization')[0] ?? '';
+    $token = str_replace('Bearer ', '', $token);
+    $data = json_decode($request->getBody());
+    $title = $data->title ?? null;
 
     try {
-        // Decode the JWT and validate the token
-        $decoded = JWT::decode($jwt, new Key($key, 'HS256'));
+        // Create a new PDO connection using the function
+        $conn = createDatabaseConnection($servername, $username, $password, $dbname);
 
-        // Check if token has expired
-        if ($decoded->exp < time()) {
-            return $response->withStatus(401)->getBody()->write(json_encode(["status" => "fail", "message" => "Token expired"]));
+        // Check if the token has already been used
+        if (isTokenUsed($token, $conn)) {
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Token has already been used")
+            )));
+            return $response->withStatus(403);  // Forbidden
         }
 
-        // Check the action
-        if ($decoded->action !== 'show_books') {
-            return $response->withStatus(403)->getBody()->write(json_encode(["status" => "fail", "message" => "Invalid action for this token"]));
+        // Validate the token
+        $decoded = validateToken($token, $key);
+        if (!$decoded) {
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Invalid or expired token")
+            )));
+            return $response->withStatus(401);  // Unauthorized
         }
 
-        // Database connection
-        $conn = new PDO("mysql:host=$servername;dbname=$dbname", $dbusername, $dbpassword);
-        $conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+        // Extract user ID from token for rotation
+        $userId = $decoded->data->userid;
 
-        // Prepare and execute the query to get only bookid and title
+        // Ensure title is provided
+        if (empty($title)) {
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Title cannot be empty")
+            )));
+            return $response->withStatus(400);  // Bad Request
+        }
+
+        // Check if the book title already exists
+        $stmt = $conn->prepare("SELECT * FROM books WHERE title = :title");
+        $stmt->bindParam(':title', $title);
+        $stmt->execute();
+
+        if ($stmt->rowCount() > 0) {
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Book already exists")
+            )));
+            return $response->withStatus(400);  // Bad Request
+        }
+
+        // Insert new book into the database
+        $sql = "INSERT INTO books (title) VALUES (:title)";
+        $stmt = $conn->prepare($sql);
+        $stmt->bindParam(':title', $title);
+        $stmt->execute();
+
+        // Mark the token as used
+        markTokenAsUsed($conn, $token);
+
+        // Generate a new token for the user
+        $newToken = generateToken($userId);
+
+        // Return success response with the new token
+        $response->getBody()->write(json_encode(array(
+            "status" => "success",
+            "token" => $newToken,
+            "data" => null
+        )));
+    } catch (PDOException $e) {
+        $response->getBody()->write(json_encode(array(
+            "status" => "fail",
+            "data" => array("title" => $e->getMessage())
+        )));
+        return $response->withStatus(500);  // Internal Server Error
+    }
+
+    return $response;
+});
+
+// Display books
+$app->get('/book/display', function (Request $request, Response $response, array $args) use ($servername, $username, $password, $dbname, $key) {
+    $token = $request->getHeader('Authorization')[0] ?? '';
+    $token = str_replace('Bearer ', '', $token);
+
+    try {
+        // Create a new PDO connection using the function
+        $conn = createDatabaseConnection($servername, $username, $password, $dbname);
+
+        // Check if the token has already been used
+        if (isTokenUsed($token, $conn)) {
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Token has already been used")
+            )));
+            return $response->withStatus(403);  // Forbidden
+        }
+
+        // Validate the token
+        $decoded = validateToken($token, $key);
+        if (!$decoded) {
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Invalid or expired token")
+            )));
+            return $response->withStatus(401);  // Unauthorized
+        }
+
+        // Extract user ID from token for rotation
+        $userId = $decoded->data->userid;
+
+        // Fetch the books from the database
         $stmt = $conn->prepare("SELECT bookid, title FROM books");
         $stmt->execute();
         $books = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-        if ($books) {
-            $response->getBody()->write(json_encode(["status" => "success", "data" => $books]));
-        } else {
-            return $response->withStatus(404)->getBody()->write(json_encode(["status" => "fail", "message" => "No books found"]));
-        }
-    } catch (Exception $e) {
-        return $response->withStatus(401)->getBody()->write(json_encode(["status" => "fail", "message" => "Invalid token: " . $e->getMessage()]));
+        // Mark the token as used
+        markTokenAsUsed($conn, $token);
+
+        // Generate a new token for the user 
+        $newToken = generateToken($userId);
+
+        // Return success response with the new token
+        $response->getBody()->write(json_encode(array(
+            "status" => "success",
+            "token" => $newToken,
+            "data" => $books
+        )));
     } catch (PDOException $e) {
-        return $response->withStatus(500)->getBody()->write(json_encode(["status" => "fail", "message" => $e->getMessage()]));
+        $response->getBody()->write(json_encode(array(
+            "status" => "fail",
+            "data" => array("title" => $e->getMessage())
+        )));
+        return $response->withStatus(500);  // Internal Server Error
+    }
+
+    return $response;
+});
+
+// Update book info
+$app->put('/book/update', function (Request $request, Response $response, array $args) use ($servername, $username, $password, $dbname, $key) {
+    $token = $request->getHeader('Authorization')[0] ?? '';
+    $token = str_replace('Bearer ', '', $token);
+    $data = json_decode($request->getBody());
+    $bookId = $data->bookid ?? null;  // Required field
+    $newTitle = $data->title ?? null;  // Optional field
+
+    try {
+        // Create a new PDO connection using the function
+        $conn = createDatabaseConnection($servername, $username, $password, $dbname);
+
+        // Check if the token has already been used
+        if (isTokenUsed($token, $conn)) {
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Token has already been used")
+            )));
+            return $response->withStatus(403);  // Forbidden
+        }
+
+        // Validate the token
+        $decoded = validateToken($token, $key);
+        if (!$decoded) {
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Invalid or expired token")
+            )));
+            return $response->withStatus(401);  // Unauthorized
+        }
+
+        // Extract user ID from token for rotation
+        $userId = $decoded->data->userid;
+
+        // Ensure the book ID is provided
+        if (empty($bookId)) {
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Book ID is required")
+            )));
+            return $response->withStatus(400);  // Bad Request
+        }
+
+        // 4. Prepare the update statement
+        if ($newTitle) {
+            // Check if the book ID exists
+            $stmt = $conn->prepare("SELECT * FROM books WHERE bookid = :bookid");
+            $stmt->bindParam(':bookid', $bookId);
+            $stmt->execute();
+
+            if ($stmt->rowCount() == 0) {
+                // Book ID does not exist
+                $response->getBody()->write(json_encode(array(
+                    "status" => "fail",
+                    "data" => array("title" => "Book ID not found")
+                )));
+                return $response->withStatus(404);  // Not Found
+            }
+
+            // Update the book's title
+            $stmt = $conn->prepare("UPDATE books SET title = :title WHERE bookid = :bookid");
+            $stmt->bindParam(':title', $newTitle);
+            $stmt->bindParam(':bookid', $bookId);
+            $stmt->execute();
+        } else {
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "No fields to update")
+            )));
+            return $response->withStatus(400);  // Bad Request
+        }
+
+        // Mark the token as used
+        markTokenAsUsed($conn, $token);
+
+        // Generate a new token for the user 
+        $newToken = generateToken($userId);
+
+        // Return success response with the new token
+        $response->getBody()->write(json_encode(array(
+            "status" => "success",
+            "token" => $newToken,
+            "data" => null
+        )));
+    } catch (PDOException $e) {
+        $response->getBody()->write(json_encode(array(
+            "status" => "fail",
+            "data" => array("title" => $e->getMessage())
+        )));
+        return $response->withStatus(500);  // Internal Server Error
+    }
+
+    return $response;
+});
+
+// Delete a book
+$app->delete('/book/delete', function (Request $request, Response $response, array $args) use ($servername, $username, $password, $dbname, $key) {
+    $token = $request->getHeader('Authorization')[0] ?? '';
+    $token = str_replace('Bearer ', '', $token);
+    $data = json_decode($request->getBody());
+    $bookId = $data->bookid ?? null;  // Required field
+
+    try {
+        // Create a new PDO connection using the function
+        $conn = createDatabaseConnection($servername, $username, $password, $dbname);
+
+        // Check if the token has already been used
+        if (isTokenUsed($token, $conn)) {
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Token has already been used")
+            )));
+            return $response->withStatus(403);  // Forbidden
+        }
+
+        // Validate the token
+        $decoded = validateToken($token, $key);
+        if (!$decoded) {
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Invalid or expired token")
+            )));
+            return $response->withStatus(401);  // Unauthorized
+        }
+
+        // Extract user ID from token for rotation
+        $userId = $decoded->data->userid;
+
+        // Ensure the book ID is provided
+        if (empty($bookId)) {
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Book ID is required")
+            )));
+            return $response->withStatus(400);  // Bad Request
+        }
+
+        // Check if the book ID exists
+        $stmt = $conn->prepare("SELECT * FROM books WHERE bookid = :bookid");
+        $stmt->bindParam(':bookid', $bookId);
+        $stmt->execute();
+
+        if ($stmt->rowCount() == 0) {
+            // Book ID does not exist
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Book ID not found")
+            )));
+            return $response->withStatus(404);  // Not Found
+        }
+
+        // Delete the book
+        $stmt = $conn->prepare("DELETE FROM books WHERE bookid = :bookid");
+        $stmt->bindParam(':bookid', $bookId);
+        $stmt->execute();
+
+        // Mark the token as used
+        markTokenAsUsed($conn, $token);
+
+        // Generate a new token for the user 
+        $newToken = generateToken($userId);
+
+        // Return success response with the new token
+        $response->getBody()->write(json_encode(array(
+            "status" => "success",
+            "token" => $newToken,
+            "data" => null
+        )));
+    } catch (PDOException $e) {
+        $response->getBody()->write(json_encode(array(
+            "status" => "fail",
+            "data" => array("title" => $e->getMessage())
+        )));
+        return $response->withStatus(500);  // Internal Server Error
+    }
+
+    return $response;
+});
+
+$app->post('/books_author/add', function (Request $request, Response $response, array $args) use ($servername, $username, $password, $dbname, $key) {
+    $token = $request->getHeader('Authorization')[0] ?? '';
+    $token = str_replace('Bearer ', '', $token);
+    $data = json_decode($request->getBody());
+    $bookId = $data->bookid ?? null;
+    $authorId = $data->authorid ?? null;
+
+    try {
+        // Create a new PDO connection using the function
+        $conn = createDatabaseConnection($servername, $username, $password, $dbname);
+
+        if (isTokenUsed($token, $conn)) {
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Token has already been used")
+            )));
+            return $response->withStatus(403);
+        }
+
+        $decoded = validateToken($token, $key);
+        if (!$decoded) {
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Invalid or expired token")
+            )));
+            return $response->withStatus(401);
+        }
+
+        // Extract user ID from token for rotation
+        $userId = $decoded->data->userid;
+
+        if (empty($bookId) || empty($authorId)) {
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Book ID and Author ID are required")
+            )));
+            return $response->withStatus(400);
+        }
+
+        // Check if the book ID exists
+        $stmt = $conn->prepare("SELECT * FROM books WHERE bookid = :bookid");
+        $stmt->bindParam(':bookid', $bookId);
+        $stmt->execute();
+        if ($stmt->rowCount() == 0) {
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Book ID not found")
+            )));
+            return $response->withStatus(404);  // Not Found
+        }
+
+        // Check if the author ID exists
+        $stmt = $conn->prepare("SELECT * FROM authors WHERE authorid = :authorid");
+        $stmt->bindParam(':authorid', $authorId);
+        $stmt->execute();
+        if ($stmt->rowCount() == 0) {
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Author ID not found")
+            )));
+            return $response->withStatus(404);  // Not Found
+        }
+
+        // Check if the association already exists
+        $stmt = $conn->prepare("SELECT * FROM books_authors WHERE bookid = :bookid AND authorid = :authorid");
+        $stmt->bindParam(':bookid', $bookId);
+        $stmt->bindParam(':authorid', $authorId);
+        $stmt->execute();
+
+        if ($stmt->rowCount() > 0) {
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "This author is already associated with the book")
+            )));
+            return $response->withStatus(400);
+        }
+
+        // Insert new association
+        $stmt = $conn->prepare("INSERT INTO books_authors (bookid, authorid) VALUES (:bookid, :authorid)");
+        $stmt->bindParam(':bookid', $bookId);
+        $stmt->bindParam(':authorid', $authorId);
+        $stmt->execute();
+
+        // Mark the token as used
+        markTokenAsUsed($conn, $token);
+
+        // Generate a new token for the user
+        $newToken = generateToken($userId);
+
+        // Return success response with the new token
+        $response->getBody()->write(json_encode(array(
+            "status" => "success",
+            "token" => $newToken,
+            "data" => null
+        )));
+    } catch (PDOException $e) {
+        $response->getBody()->write(json_encode(array(
+            "status" => "fail",
+            "data" => array("title" => $e->getMessage())
+        )));
+        return $response->withStatus(500);  // Internal Server Error
+    }
+
+    return $response;
+});
+
+
+
+// display books_authors
+$app->get('/books_authors/display', function (Request $request, Response $response, array $args) use ($servername, $username, $password, $dbname, $key) {
+    $token = $request->getHeader('Authorization')[0] ?? '';
+    $token = str_replace('Bearer ', '', $token);
+
+    try {
+        // Create a new PDO connection using the function
+        $conn = createDatabaseConnection($servername, $username, $password, $dbname);
+
+        // Check if the token has already been used
+        if (isTokenUsed($token, $conn)) {
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Token has already been used")
+            )));
+            return $response->withStatus(403);  // Forbidden
+        }
+
+        // Validate the token
+        $decoded = validateToken($token, $key);
+        if (!$decoded) {
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Invalid or expired token")
+            )));
+            return $response->withStatus(401);  // Unauthorized
+        }
+
+        // Extract user ID from token for rotation
+        $userId = $decoded->data->userid;
+
+        // Fetch the data from book_authors table
+        $stmt = $conn->prepare("SELECT collectionid, bookid, authorid FROM books_authors");
+        $stmt->execute();
+        $bookAuthors = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+        // Mark the token as used
+        markTokenAsUsed($conn, $token);
+
+        // Generate a new token for the user 
+        $newToken = generateToken($userId);
+
+        // Return the results as a response
+        $response->getBody()->write(json_encode(array(
+            "status" => "success",
+            "token" => $newToken,
+            "data" => $bookAuthors
+        )));
+    } catch (PDOException $e) {
+        // Handle DB errors
+        $response->getBody()->write(json_encode(array(
+            "status" => "fail",
+            "data" => array("title" => $e->getMessage())
+        )));
+        return $response->withStatus(500);  // Internal Server Error
+    }
+
+    return $response;
+});
+
+// display books_authors with labels instead of its id
+$app->get('/books_author/display_with_names', function (Request $request, Response $response, array $args) use ($servername, $username, $password, $dbname, $key) {
+    $token = $request->getHeader('Authorization')[0] ?? '';
+    $token = str_replace('Bearer ', '', $token);
+
+    try {
+        // Create a new PDO connection using the function
+        $conn = createDatabaseConnection($servername, $username, $password, $dbname);
+
+        // Check if the token has already been used
+        if (isTokenUsed($token, $conn)) {
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Token has already been used")
+            )));
+            return $response->withStatus(403);  // Forbidden
+        }
+
+        // Validate the token
+        $decoded = validateToken($token, $key);
+        if (!$decoded) {
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Invalid or expired token")
+            )));
+            return $response->withStatus(401);  // Unauthorized
+        }
+
+        // Extract user ID from token for rotation
+        $userId = $decoded->data->userid;
+
+        // Join book_authors with books and authors tables to fetch names
+        $stmt = $conn->prepare("
+            SELECT 
+                ba.collectionid, 
+                b.title AS book_name, 
+                a.name AS author_name 
+            FROM books_authors ba
+            JOIN books b ON ba.bookid = b.bookid
+            JOIN authors a ON ba.authorid = a.authorid
+        ");
+        $stmt->execute();
+        $bookAuthorsWithNames = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+        // Mark the token as used
+        markTokenAsUsed($conn, $token);
+
+        // Generate a new token for the user 
+        $newToken = generateToken($userId);
+
+        // Return the results as a response
+        $response->getBody()->write(json_encode(array(
+            "status" => "success",
+            "token" => $newToken,
+            "data" => $bookAuthorsWithNames
+        )));
+    } catch (PDOException $e) {
+        // Handle DB errors
+        $response->getBody()->write(json_encode(array(
+            "status" => "fail",
+            "data" => array("title" => $e->getMessage())
+        )));
+        return $response->withStatus(500);  // Internal Server Error
+    }
+
+    return $response;
+});
+
+// update books_authors table
+$app->put('/books_author/update', function (Request $request, Response $response, array $args) use ($servername, $username, $password, $dbname, $key) {
+    $token = $request->getHeader('Authorization')[0] ?? '';
+    $token = str_replace('Bearer ', '', $token);
+    $data = json_decode($request->getBody());
+    $collectionId = $data->collectionid ?? null;  // Required field
+    $newBookId = $data->bookid ?? null;            // Optional field
+    $newAuthorId = $data->authorid ?? null;        // Optional field
+
+    try {
+        // Create a new PDO connection using the function
+        $conn = createDatabaseConnection($servername, $username, $password, $dbname);
+
+        // Check if the token has already been used
+        if (isTokenUsed($token, $conn)) {
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Token has already been used")
+            )));
+            return $response->withStatus(403);  // Forbidden
+        }
+
+        // Validate the token
+        $decoded = validateToken($token, $key);
+        if (!$decoded) {
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Invalid or expired token")
+            )));
+            return $response->withStatus(401);  // Unauthorized
+        }
+
+        // Extract user ID from token for rotation
+        $userId = $decoded->data->userid;
+
+        // Ensure the collection ID is provided
+        if (empty($collectionId)) {
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Collection ID is required")
+            )));
+            return $response->withStatus(400);  // Bad Request
+        }
+
+        // Check if the collection ID exists
+        $stmt = $conn->prepare("SELECT * FROM books_authors WHERE collectionid = :collectionid");
+        $stmt->bindParam(':collectionid', $collectionId);
+        $stmt->execute();
+
+        if ($stmt->rowCount() == 0) {
+            // Collection ID does not exist
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Collection ID not found")
+            )));
+            return $response->withStatus(404);  // Not Found
+        }
+
+        // Update bookid and/or authorid if provided
+        $updateFields = [];
+        $params = ['collectionid' => $collectionId];
+
+        if (!empty($newBookId)) {
+            $updateFields[] = "bookid = :bookid";
+            $params['bookid'] = $newBookId;
+        }
+
+        if (!empty($newAuthorId)) {
+            $updateFields[] = "authorid = :authorid";
+            $params['authorid'] = $newAuthorId;
+        }
+
+        if (empty($updateFields)) {
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "No fields to update")
+            )));
+            return $response->withStatus(400);  // Bad Request
+        }
+
+        // Prepare the update statement
+        $sql = "UPDATE books_authors SET " . implode(", ", $updateFields) . " WHERE collectionid = :collectionid";
+        $stmt = $conn->prepare($sql);
+        $stmt->execute($params);
+
+        // Mark the token as used
+        markTokenAsUsed($conn, $token);
+
+        // Generate a new token for the user 
+        $newToken = generateToken($userId);
+
+        // Return success response
+        $response->getBody()->write(json_encode(array(
+            "status" => "success",
+            "token" => $newToken,
+            "data" => null
+        )));
+    } catch (PDOException $e) {
+        // Handle DB errors
+        $response->getBody()->write(json_encode(array(
+            "status" => "fail",
+            "data" => array("title" => $e->getMessage())
+        )));
+        return $response->withStatus(500);  // Internal Server Error
+    }
+
+    return $response;
+});
+
+// delete books_authors
+$app->delete('/books_author/delete', function (Request $request, Response $response, array $args) use ($servername, $username, $password, $dbname, $key) {
+    $token = $request->getHeader('Authorization')[0] ?? '';
+    $token = str_replace('Bearer ', '', $token);
+    $data = json_decode($request->getBody());
+    $collectionId = $data->collectionid ?? null;  // Get collectionid from request body
+
+    try {
+        // Create a new PDO connection using the function
+        $conn = createDatabaseConnection($servername, $username, $password, $dbname);
+
+        // Check if the token has already been used
+        if (isTokenUsed($token, $conn)) {
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Token has already been used")
+            )));
+            return $response->withStatus(403);
+        }
+
+        // Validate the token
+        $decoded = validateToken($token, $key);
+        if (!$decoded) {
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Invalid or expired token")
+            )));
+            return $response->withStatus(401);
+        }
+
+        // Extract user ID from token for rotation
+        $userId = $decoded->data->userid;
+
+        // Check if collection ID is provided
+        if (empty($collectionId)) {
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Collection ID is required")
+            )));
+            return $response->withStatus(400);
+        }
+
+        // Check if the association exists
+        $stmt = $conn->prepare("SELECT * FROM books_authors WHERE collectionid = :collectionid");
+        $stmt->bindParam(':collectionid', $collectionId);
+        $stmt->execute();
+
+        if ($stmt->rowCount() == 0) {
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "No association found with the given collection ID")
+            )));
+            return $response->withStatus(404);
+        }
+
+        // Delete the association
+        $stmt = $conn->prepare("DELETE FROM books_authors WHERE collectionid = :collectionid");
+        $stmt->bindParam(':collectionid', $collectionId);
+        $stmt->execute();
+
+        // Mark the token as used
+        markTokenAsUsed($conn, $token);
+
+        // Generate a new token for the user 
+        $newToken = generateToken($userId);
+
+        // Return success response with the new token
+        $response->getBody()->write(json_encode(array(
+            "status" => "success",
+            "token" => $newToken,
+            "data" => null
+        )));
+    } catch (PDOException $e) {
+        $response->getBody()->write(json_encode(array(
+            "status" => "fail",
+            "data" => array("title" => $e->getMessage())
+        )));
+        return $response->withStatus(500);
+    }
+
+    return $response;
+});
+
+// Combined endpoint to fetch books, authors, and book-author relationships
+$app->get('/dashboard/data', function (Request $request, Response $response, array $args) use ($servername, $username, $password, $dbname, $key) {
+    $token = $request->getHeader('Authorization')[0] ?? '';
+    $token = str_replace('Bearer ', '', $token);
+
+    try {
+        // Create a new PDO connection using the function
+        $conn = createDatabaseConnection($servername, $username, $password, $dbname);
+
+        // Check if the token has already been used
+        if (isTokenUsed($token, $conn)) {
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Token has already been used")
+            )));
+            return $response->withStatus(403);  // Forbidden
+        }
+
+        // Validate the token
+        $decoded = validateToken($token, $key);
+        if (!$decoded) {
+            $response->getBody()->write(json_encode(array(
+                "status" => "fail",
+                "data" => array("title" => "Invalid or expired token")
+            )));
+            return $response->withStatus(401);  // Unauthorized
+        }
+
+        // Extract user ID from token for rotation
+        $userId = $decoded->data->userid;
+
+        // Fetch data from the authors table
+        $stmt = $conn->prepare("SELECT authorid, name FROM authors");
+        $stmt->execute();
+        $authors = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+        // Fetch data from the books table
+        $stmt = $conn->prepare("SELECT bookid, title FROM books");
+        $stmt->execute();
+        $books = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+        // Fetch data from the books_authors table (joining books and authors)
+        $stmt = $conn->prepare("
+            SELECT 
+                ba.collectionid, 
+                b.title AS book_name, 
+                a.name AS author_name 
+            FROM books_authors ba
+            JOIN books b ON ba.bookid = b.bookid
+            JOIN authors a ON ba.authorid = a.authorid
+        ");
+        $stmt->execute();
+        $bookAuthorsWithNames = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+        // Mark the token as used
+        markTokenAsUsed($conn, $token);
+
+        // Generate a new token for the user
+        $newToken = generateToken($userId);
+
+        // Return all the fetched data as a single response
+        $response->getBody()->write(json_encode(array(
+            "status" => "success",
+            "token" => $newToken,
+            "data" => array(
+                'authors' => $authors,
+                'books' => $books,
+                'bookAuthors' => $bookAuthorsWithNames
+            )
+        )));
+    } catch (PDOException $e) {
+        // Handle DB errors
+        $response->getBody()->write(json_encode(array(
+            "status" => "fail",
+            "data" => array("title" => $e->getMessage())
+        )));
+        return $response->withStatus(500);  // Internal Server Error
+    }
+
+    return $response;
+});
+
+
+
+// Fetch all authors
+$app->get('/user', function (Request $request, Response $response, array $args) use ($servername, $username, $password, $dbname, $key) {
+    $token = $request->getHeader('Authorization')[0] ?? '';
+    $token = str_replace('Bearer ', '', $token);  // Remove "Bearer " from token if present
+
+    try {
+        // Create a new PDO connection
+        $conn = createDatabaseConnection($servername, $username, $password, $dbname);
+
+        // Check if the token has already been used
+        if (isTokenUsed($token, $conn)) {
+            $response->getBody()->write(json_encode([
+                "status" => "fail",
+                "data" => ["title" => "Token has already been used"]
+            ]));
+            return $response->withStatus(403);  // Forbidden
+        }
+
+        // Validate the token
+        $decoded = validateToken($token, $key);
+        if (!$decoded) {
+            $response->getBody()->write(json_encode([
+                "status" => "fail",
+                "data" => ["title" => "Invalid or expired token"]
+            ]));
+            return $response->withStatus(401);  // Unauthorized
+        }
+
+        // Fetch the users from the database
+        $stmt = $conn->prepare("SELECT userid, username FROM users");
+        $stmt->execute();
+        $users = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+        // Mark the token as used
+        markTokenAsUsed($conn, $token);
+
+        // Generate a new token using the function
+        $newToken = generateToken($decoded->data->userid);
+
+        // Return the users and the new token in the response
+        $response->getBody()->write(json_encode([
+            "status" => "success",
+            "token" => $newToken,
+            "data" => $users
+
+        ]));
+        return $response->withStatus(200);  // Success
+    } catch (PDOException $e) {
+        // Handle DB errors
+        $response->getBody()->write(json_encode([
+            "status" => "fail",
+            "data" => ["title" => $e->getMessage()]
+        ]));
+        return $response->withStatus(500);  // Internal Server Error
+    }
+});
+
+// Fetch all books
+$app->get('/books', function (Request $request, Response $response, array $args) use ($servername, $username, $password, $dbname) {
+    try {
+        $conn = createDatabaseConnection($servername, $username, $password, $dbname);
+        $stmt = $conn->prepare("SELECT * FROM books");
+        $stmt->execute();
+        $books = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        
+        $response->getBody()->write(json_encode(array(
+            "status" => "success",
+            "data" => $books
+        )));
+    } catch (PDOException $e) {
+        $response->getBody()->write(json_encode(array(
+            "status" => "fail",
+            "data" => array("title" => $e->getMessage())
+        )));
+        return $response->withStatus(500);
     }
 
     return $response;
@@ -933,45 +1673,6 @@ $app->get('/books', function (Request $request, Response $response, array $args)
 
 
 
-// Show all books and authors (requires 'showAllBooksAndAuthors' token)
-$app->get('/books-authors', function (Request $request, Response $response, array $args) use ($servername, $dbusername, $dbpassword, $dbname) {
-    $authHeader = $request->getHeader('Authorization');
-    if (!$authHeader) {
-        return $response->withStatus(401)->getBody()->write(json_encode(["status" => "fail", "message" => "Missing Authorization header"]));
-    }
-
-    $jwt = str_replace('Bearer ', '', $authHeader[0]);
-    $key = 'server_hack';
-
-    try {
-        $decoded = JWT::decode($jwt, new Key($key, 'HS256'));
-
-        if ($decoded->exp < time()) {
-            return $response->withStatus(401)->getBody()->write(json_encode(["status" => "fail", "message" => "Token expired"]));
-        }
-
-        if ($decoded->action !== 'showAllBooksAndAuthors') {
-            return $response->withStatus(403)->getBody()->write(json_encode(["status" => "fail", "message" => "Permission denied"]));
-        }
-
-        // Fetch all books and authors
-        $conn = new PDO("mysql:host=$servername;dbname=$dbname", $dbusername, $dbpassword);
-        $conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-        $stmt = $conn->prepare("SELECT b.bookid, b.title, a.authorid, a.name AS author_name
-                                FROM books b
-                                JOIN books_authors ba ON b.bookid = ba.bookid
-                                JOIN authors a ON ba.authorid = a.authorid");
-        $stmt->execute();
-        $booksAuthors = $stmt->fetchAll(PDO::FETCH_ASSOC);
-
-        return $response->getBody()->write(json_encode([
-            "status" => "success",
-            "data" => $booksAuthors
-        ]));
-    } catch (Exception $e) {
-        return $response->withStatus(401)->getBody()->write(json_encode(["status" => "fail", "message" => "Invalid token"]));
-    }
-});
 
 
 
@@ -981,66 +1682,6 @@ $app->get('/books-authors', function (Request $request, Response $response, arra
 
 
 
-// Search Books
-$app->get('/search/books', function (Request $request, Response $response, array $args) use ($servername, $dbusername, $dbpassword, $dbname) {
-    // Extract JWT from the Authorization header
-    $authHeader = $request->getHeader('Authorization');
-    if (!$authHeader) {
-        return $response->withStatus(401)->getBody()->write(json_encode(["status" => "fail", "message" => "Missing Authorization header"]));
-    }
-
-    $jwt = str_replace('Bearer ', '', $authHeader[0]);
-    $key = 'server_hack';
-
-    try {
-        // Decode the JWT and validate the token
-        $decoded = JWT::decode($jwt, new Key($key, 'HS256'));
-
-        // Check if token has expired
-        if ($decoded->exp < time()) {
-            return $response->withStatus(401)->getBody()->write(json_encode(["status" => "fail", "message" => "Token expired"]));
-        }
-
-        // Check the action
-        if ($decoded->action !== 'search_books') {
-            return $response->withStatus(403)->getBody()->write(json_encode(["status" => "fail", "message" => "Invalid action for this token"]));
-        }
-
-        // Database connection
-        $conn = new PDO("mysql:host=$servername;dbname=$dbname", $dbusername, $dbpassword);
-        $conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-
-        // Get the search query from the request
-        $query = $request->getQueryParams()['q'] ?? '';
-
-        // Search for books based on the query
-        $stmt = $conn->prepare("SELECT bookid, title FROM books WHERE title LIKE :query");
-        $stmt->execute(['query' => '%' . $query . '%']);
-        $results = $stmt->fetchAll(PDO::FETCH_ASSOC);
-
-        if ($results) {
-            return $response->getBody()->write(json_encode([
-                "status" => "success",
-                "data" => $results
-            ]));
-        } else {
-            return $response->withStatus(404)->getBody()->write(json_encode([
-                "status" => "fail",
-                "message" => "No books found"
-            ]));
-        }
-    } catch (Exception $e) {
-        return $response->withStatus(401)->getBody()->write(json_encode([
-            "status" => "fail",
-            "message" => "Invalid token: " . $e->getMessage()
-        ]));
-    } catch (PDOException $e) {
-        return $response->withStatus(500)->getBody()->write(json_encode([
-            "status" => "fail",
-            "message" => "Database error: " . $e->getMessage()
-        ]));
-    }
-});
 
 
 
@@ -1050,66 +1691,8 @@ $app->get('/search/books', function (Request $request, Response $response, array
 
 
 
-// Search Authors
-$app->get('/search/authors', function (Request $request, Response $response, array $args) use ($servername, $dbusername, $dbpassword, $dbname) {
-    // Extract JWT from the Authorization header
-    $authHeader = $request->getHeader('Authorization');
-    if (!$authHeader) {
-        return $response->withStatus(401)->getBody()->write(json_encode(["status" => "fail", "message" => "Missing Authorization header"]));
-    }
 
-    $jwt = str_replace('Bearer ', '', $authHeader[0]);
-    $key = 'server_hack';
 
-    try {
-        // Decode the JWT and validate the token
-        $decoded = JWT::decode($jwt, new Key($key, 'HS256'));
-
-        // Check if token has expired
-        if ($decoded->exp < time()) {
-            return $response->withStatus(401)->getBody()->write(json_encode(["status" => "fail", "message" => "Token expired"]));
-        }
-
-        // Check the action
-        if ($decoded->action !== 'search_authors') {
-            return $response->withStatus(403)->getBody()->write(json_encode(["status" => "fail", "message" => "Invalid action for this token"]));
-        }
-
-        // Database connection
-        $conn = new PDO("mysql:host=$servername;dbname=$dbname", $dbusername, $dbpassword);
-        $conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-
-        // Get the search query from the request
-        $query = $request->getQueryParams()['q'] ?? '';
-
-        // Search for authors based on the query
-        $stmt = $conn->prepare("SELECT authorid, name FROM authors WHERE name LIKE :query");
-        $stmt->execute(['query' => '%' . $query . '%']);
-        $results = $stmt->fetchAll(PDO::FETCH_ASSOC);
-
-        if ($results) {
-            return $response->getBody()->write(json_encode([
-                "status" => "success",
-                "data" => $results
-            ]));
-        } else {
-            return $response->withStatus(404)->getBody()->write(json_encode([
-                "status" => "fail",
-                "message" => "No authors found"
-            ]));
-        }
-    } catch (Exception $e) {
-        return $response->withStatus(401)->getBody()->write(json_encode([
-            "status" => "fail",
-            "message" => "Invalid token: " . $e->getMessage()
-        ]));
-    } catch (PDOException $e) {
-        return $response->withStatus(500)->getBody()->write(json_encode([
-            "status" => "fail",
-            "message" => "Database error: " . $e->getMessage()
-        ]));
-    }
-});
 
 
 
